@@ -1,0 +1,103 @@
+name: Build Latest Custom-Nameplates
+
+# Mirrors build-latest-oraxen.yml but tuned for Xiao-MoMi/Custom-Nameplates:
+#   - default branch is `main` (not master)
+#   - JDK 21 (single, satisfies both Gradle 9.1 runtime and the toolchain)
+#   - root build.gradle.kts reads `git rev-parse --short=8 HEAD` and
+#     `git config user.name` at configuration time, so we MUST set a git
+#     identity before ./gradlew build
+#   - distributable JAR lives in `target/` (NOT `build/libs/`) and is named
+#     `CustomNameplates-Bukkit-<version>.jar` (no SHA suffix in filename)
+
+on:
+  workflow_dispatch:
+    inputs:
+      custom_nameplates_ref:
+        description: 'Branch, Tag hoặc Commit SHA của Custom-Nameplates muốn build'
+        required: true
+        default: 'main'
+        type: string
+
+  watch:
+    types: [started]
+
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  build-custom-nameplates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 1. Clone trực tiếp mã nguồn mới nhất từ Xiao-MoMi/Custom-Nameplates
+        uses: actions/checkout@v4
+        with:
+          repository: Xiao-MoMi/Custom-Nameplates
+          ref: ${{ inputs.custom_nameplates_ref || 'main' }}
+          fetch-depth: 1
+
+      - name: 2. Cài đặt JDK 21 (Gradle 9.1 runtime + toolchain target)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: 3. Kích hoạt bộ nhớ đệm Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: 4. Thiết lập git identity (bắt buộc vì build.gradle.kts đọc user.name lúc cấu hình)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --get user.name
+          git rev-parse --short=8 HEAD
+
+      - name: 5. Đọc phiên bản và build (shadowJar)
+        id: build_plugin
+        run: |
+          chmod +x gradlew
+
+          VERSION=$(grep -E '^project_version\s*=' gradle.properties | head -1 | cut -d'=' -f2 | tr -d '[:space:]')
+          SHORT_SHA=$(git rev-parse --short=8 HEAD)
+          FULL_SHA=$(git rev-parse HEAD)
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "full_sha=$FULL_SHA" >> $GITHUB_OUTPUT
+
+          echo "Đang build Custom-Nameplates v${VERSION} (Commit: ${SHORT_SHA})..."
+
+          ./gradlew build -x test --no-daemon
+
+          echo "Danh sách file .jar sinh ra tại target/:"
+          ls -lh target/ || true
+
+      - name: 6. Tải file .jar chuẩn lên mục Artifacts (Lưu 30 ngày)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CustomNameplates-${{ steps.build_plugin.outputs.version }}-${{ steps.build_plugin.outputs.short_sha }}
+          path: |
+            target/*.jar
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 7. Tự động xuất bản Release kèm file .jar trong Repo của bạn
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: customnameplates-v${{ steps.build_plugin.outputs.version }}-${{ steps.build_plugin.outputs.short_sha }}
+          name: "Custom-Nameplates v${{ steps.build_plugin.outputs.version }} (${{ steps.build_plugin.outputs.short_sha }})"
+          body: |
+            - **Phiên bản Custom-Nameplates:** `${{ steps.build_plugin.outputs.version }}`
+            - **Nhánh / Ref:** `${{ inputs.custom_nameplates_ref || 'main' }}`
+            - **Commit gốc:** [`${{ steps.build_plugin.outputs.full_sha }}`](https://github.com/Xiao-MoMi/Custom-Nameplates/commit/${{ steps.build_plugin.outputs.full_sha }})
+            - **Build bởi:** build-latest-custom-nameplates.yml
+          files: |
+            target/*.jar

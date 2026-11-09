@@ -1,0 +1,101 @@
+name: Build Latest EcoEnchants
+
+# Mirrors build-latest-oraxen.yml but tuned for Auxilor/EcoEnchants:
+#   - default branch is `master`
+#   - JDK 25 (toolchain is 25, even though bytecode target is 21)
+#   - distributable JAR is `bin/EcoEnchants v<version>.jar` (NOTE the SPACE
+#     in the filename), produced by the libreforgeJar task. NOT build/libs/.
+#   - `-x test` is safe (libreforgeJar doesn't depend on test)
+#   - no remote Maven publish in the `build` task, no secrets needed
+
+on:
+  workflow_dispatch:
+    inputs:
+      ecoenchants_ref:
+        description: 'Branch, Tag hoặc Commit SHA của EcoEnchants muốn build'
+        required: true
+        default: 'master'
+        type: string
+
+  watch:
+    types: [started]
+
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  build-ecoenchants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 1. Clone trực tiếp mã nguồn mới nhất từ Auxilor/EcoEnchants
+        uses: actions/checkout@v4
+        with:
+          repository: Auxilor/EcoEnchants
+          ref: ${{ inputs.ecoenchants_ref || 'master' }}
+          fetch-depth: 1
+
+      - name: 2. Cài đặt JDK 25 (toolchain target; bytecode release = 21)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '25'
+
+      - name: 3. Kích hoạt bộ nhớ đệm Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: 4. Thiết lập git identity (libreforge build có thể đọc thông tin git)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: 5. Đọc phiên bản và build (libreforgeJar)
+        id: build_plugin
+        run: |
+          chmod +x gradlew
+
+          VERSION=$(sed -n 's/^version=//p' gradle.properties | head -1 | tr -d '[:space:]')
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          FULL_SHA=$(git rev-parse HEAD)
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "full_sha=$FULL_SHA" >> $GITHUB_OUTPUT
+
+          echo "Đang build EcoEnchants v${VERSION} (Commit: ${SHORT_SHA})..."
+
+          ./gradlew build -x test --no-daemon
+
+          echo "Danh sách file .jar sinh ra tại bin/:"
+          ls -lh bin/ || true
+
+      - name: 6. Tải file .jar chuẩn lên mục Artifacts (Lưu 30 ngày)
+        uses: actions/upload-artifact@v4
+        with:
+          name: EcoEnchants-${{ steps.build_plugin.outputs.version }}-${{ steps.build_plugin.outputs.short_sha }}
+          # Globbin bin/*.jar handles the space in "EcoEnchants v2026.45.jar" cleanly.
+          path: |
+            bin/*.jar
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 7. Tự động xuất bản Release kèm file .jar trong Repo của bạn
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ecoenchants-v${{ steps.build_plugin.outputs.version }}-${{ steps.build_plugin.outputs.short_sha }}
+          name: "EcoEnchants v${{ steps.build_plugin.outputs.version }} (${{ steps.build_plugin.outputs.short_sha }})"
+          body: |
+            - **Phiên bản EcoEnchants:** `${{ steps.build_plugin.outputs.version }}`
+            - **Nhánh / Ref:** `${{ inputs.ecoenchants_ref || 'master' }}`
+            - **Commit gốc:** [`${{ steps.build_plugin.outputs.full_sha }}`](https://github.com/Auxilor/EcoEnchants/commit/${{ steps.build_plugin.outputs.full_sha }})
+            - **Build bởi:** build-latest-ecoenchants.yml
+          files: |
+            bin/*.jar
