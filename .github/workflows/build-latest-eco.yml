@@ -1,0 +1,127 @@
+name: Build Latest eco
+
+# Mirrors build-latest-ecoenchants.yml but tuned specifically for Auxilor/eco:
+#   - Default branch is `master`
+#   - Pre-installs both JDK 21 & JDK 25 (default = 25) for multi-NMS Paperweight modules (1.21.x -> 26.x)
+#   - Tuned JVM heap (-Xmx4g) & timeout (45 mins) to handle heavy multi-version NMS remapping smoothly
+#   - Distributable JAR is `bin/eco v<version>.jar` (NOTE the SPACE in the filename)
+#   - Automatic fallback `-x check` if upstream checkstyle/detekt/jvm-lint has transient warnings
+#   - No remote Maven publish in the `build` task, no secrets needed
+
+on:
+  workflow_dispatch:
+    inputs:
+      eco_ref:
+        description: 'Branch, Tag hoặc Commit SHA của eco muốn build'
+        required: true
+        default: 'master'
+        type: string
+
+  watch:
+    types: [started]
+
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-eco-${{ github.ref }}-${{ inputs.eco_ref || 'master' }}
+  cancel-in-progress: true
+
+jobs:
+  build-eco:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -XX:+UseParallelGC -Dfile.encoding=UTF-8"
+
+    steps:
+      - name: 1. Clone trực tiếp mã nguồn mới nhất từ Auxilor/eco
+        uses: actions/checkout@v4
+        with:
+          repository: Auxilor/eco
+          ref: ${{ inputs.eco_ref || 'master' }}
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: 2. Cài đặt JDK 21 & JDK 25 (JDK 25 mặc định, hỗ trợ đa module NMS 1.21.x - 26.x)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: |
+            21
+            25
+
+      - name: 3. Kích hoạt bộ nhớ đệm Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: 4. Thiết lập git identity (phục vụ quá trình đóng gói và đọc metadata git)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: 5. Đọc phiên bản và build eco (kèm cơ chế chống lỗi linter upstream)
+        id: build_plugin
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+
+          VERSION=$(sed -n 's/^version=//p' gradle.properties | head -1 | tr -d '[:space:]')
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          FULL_SHA=$(git rev-parse HEAD)
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "full_sha=$FULL_SHA" >> "$GITHUB_OUTPUT"
+
+          echo "Đang build eco v${VERSION} (Commit: ${SHORT_SHA})..."
+
+          # Chạy build bỏ qua test; nếu upstream vướng lỗi linter (detekt/checkstyle/jvm-lint) thì tự động fallback bỏ qua check
+          if ! ./gradlew build -x test --no-daemon; then
+            echo "::warning::Linter upstream gặp lỗi, tự động chạy lại với -x check để đảm bảo lấy được bản build..."
+            ./gradlew build -x test -x check --no-daemon
+          fi
+
+          # Đảm bảo thư mục bin/ có chứa file .jar phân phối chuẩn
+          mkdir -p bin
+          if ! compgen -G "bin/*.jar" > /dev/null; then
+            echo "Không tìm thấy jar trong bin/, đang tìm từ build/libs/..."
+            find . -path "*/build/libs/*.jar" ! -name "*-sources.jar" ! -name "*-javadoc.jar" ! -name "*-plain.jar" -exec cp -v {} bin/ \;
+          fi
+
+          echo "Danh sách file .jar sinh ra tại bin/:"
+          ls -lh bin/
+
+          SHA256_HASH=$(sha256sum bin/*.jar | awk '{print $1}' | head -n 1)
+          echo "sha256=$SHA256_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: 6. Tải file .jar chuẩn lên mục Artifacts (Lưu 30 ngày)
+        uses: actions/upload-artifact@v4
+        with:
+          name: eco-${{ steps.build_plugin.outputs.version }}-${{ steps.build_plugin.outputs.short_sha }}
+          # Globbing bin/*.jar xử lý mượt khoảng trắng trong tên file "eco v2026.45.jar"
+          path: |
+            bin/*.jar
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 7. Tự động xuất bản Release kèm file .jar trong Repo của bạn
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: eco-v${{ steps.build_plugin.outputs.version }}-${{ steps.build_plugin.outputs.short_sha }}
+          name: "eco v${{ steps.build_plugin.outputs.version }} (${{ steps.build_plugin.outputs.short_sha }})"
+          body: |
+            - **Phiên bản eco:** `${{ steps.build_plugin.outputs.version }}`
+            - **Nhánh / Ref:** `${{ inputs.eco_ref || 'master' }}`
+            - **Commit gốc:** [`${{ steps.build_plugin.outputs.full_sha }}`](https://github.com/Auxilor/eco/commit/${{ steps.build_plugin.outputs.full_sha }})
+            - **SHA-256:** `${{ steps.build_plugin.outputs.sha256 }}`
+            - **Build bởi:** `build-latest-eco.yml`
+          files: |
+            bin/*.jar
